@@ -1,0 +1,12 @@
+[theme]
+base = "light"
+primaryColor = "#0693e3"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f8fa"
+textColor = "#32373c"
+font = "sans serif"
+
+[server]
+runOnSave = true
+fileWatcherType = "poll"
+headless = true
