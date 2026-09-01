@@ -51,10 +51,17 @@ MONTH_LETTERS = {
     "N": "Jul", "Q": "Aug", "U": "Sep", "V": "Oct", "X": "Nov", "Z": "Dec",
 }
 
+# Standard CME contract months per product, confirmed from a live /contracts pull.
+STANDARD_MONTHS = {"LE": "GJMQVZ", "GF": "FHJKQUVX", "HE": "GJKMNQVZ"}
+CONTINUOUS_YEARS_BACK = 6
+MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
 YEAR_COLORS = ["#0693e3", "#e8833a", "#5aa469", "#b05fb0", "#9aa5b1", "#c0392b"]
 AVG_COLOR = "#111111"
 EXP_COLOR = "#c62828"
 FND_COLOR = "#8e24aa"
+UP_COLOR = "#16a34a"
+DOWN_COLOR = "#dc2626"
 MAX_YEARS_BACK = 5
 DATA_START_NOTE = (
     "Massive's daily settlement history starts 2021-09-02, so seasonal overlays "
@@ -122,6 +129,105 @@ def load_curve(product_code: str, api_key: str, as_of: str, n_contracts: int) ->
 @st.cache_data(ttl="6h", show_spinner="Loading settlement history…")
 def load_histories(tickers: tuple[str, ...], api_key: str) -> dict[str, pd.Series]:
     return get_settlement_histories(list(tickers), api_key)
+
+
+@st.cache_data(ttl="6h", show_spinner="Building continuous nearby series…")
+def build_continuous_series(product_code: str, api_key: str, as_of: str, curve: pd.DataFrame) -> pd.Series:
+    """Splice consecutive front-month contracts into one unadjusted 'nearby' series:
+    on each date, the settle of whichever contract expires soonest. This is the
+    standard nearby-futures construction — not back-adjusted, so a small gap can
+    appear at each roll where the new front month settled at a different level."""
+    as_of_date = date.fromisoformat(as_of)
+    year_digit = as_of_date.year % 10
+    tickers = []
+    for letter in STANDARD_MONTHS.get(product_code, ""):
+        baseline = f"{product_code}{letter}{year_digit}"
+        for back in range(CONTINUOUS_YEARS_BACK):
+            t = shift_ticker_year(baseline, product_code, -back)
+            if t:
+                tickers.append(t)
+
+    hist = get_settlement_histories(sorted(set(tickers)), api_key)
+    live_expiry = dict(zip(curve["ticker"], curve["expiration"]))
+
+    legs = []
+    for t, series in hist.items():
+        if series is None or not len(series):
+            continue
+        expiry = live_expiry.get(t, series.index.max())
+        legs.append((expiry, series))
+    legs.sort(key=lambda pair: pair[0])
+
+    continuous: dict = {}
+    prev_expiry = None
+    for expiry, series in legs:
+        segment = series[series.index <= expiry]
+        if prev_expiry is not None:
+            segment = segment[segment.index > prev_expiry]
+        continuous.update(segment.to_dict())
+        prev_expiry = expiry
+
+    if not continuous:
+        return pd.Series(dtype=float)
+    result = pd.Series(continuous).sort_index()
+    result.index = pd.to_datetime(result.index)
+    return result
+
+
+def resample_ohlc(series: pd.Series, rule: str) -> pd.DataFrame:
+    """Weekly/monthly bars derived from daily settlement closes — there's no true
+    intraday high/low in this feed, so open/high/low/close are the first, max,
+    min, and last daily close within each period."""
+    ohlc = series.resample(rule).agg(["first", "max", "min", "last"]).dropna()
+    ohlc.columns = ["open", "high", "low", "close"]
+    return ohlc
+
+
+def highs_lows_by_month(series: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame, list[int]]:
+    """Per-year date/price of the annual high and low, plus a month-frequency
+    summary across complete calendar years (a year in progress, or a partial
+    year at the start of the feed's history, is excluded from the summary
+    since its high/low can only fall within the months already elapsed)."""
+    df = series.rename("price").to_frame()
+    df["year"] = df.index.year
+    rows = []
+    for yr, g in df.groupby("year"):
+        high_date = g["price"].idxmax()
+        low_date = g["price"].idxmin()
+        complete = (
+            g.index.min() <= pd.Timestamp(year=int(yr), month=1, day=10)
+            and g.index.max() >= pd.Timestamp(year=int(yr), month=12, day=20)
+        )
+        rows.append({
+            "Year": int(yr),
+            "High date": high_date.date(),
+            "High price": float(g.loc[high_date, "price"]),
+            "High month": high_date.strftime("%b"),
+            "Low date": low_date.date(),
+            "Low price": float(g.loc[low_date, "price"]),
+            "Low month": low_date.strftime("%b"),
+            "Complete year": complete,
+        })
+    per_year = pd.DataFrame(rows)
+    if per_year.empty:
+        return per_year, pd.DataFrame(), []
+
+    complete_years = per_year[per_year["Complete year"]]
+    excluded = sorted(per_year.loc[~per_year["Complete year"], "Year"].tolist())
+    n = len(complete_years)
+    if n == 0:
+        return per_year, pd.DataFrame(), excluded
+
+    high_counts = complete_years["High month"].value_counts().reindex(MONTH_ORDER, fill_value=0)
+    low_counts = complete_years["Low month"].value_counts().reindex(MONTH_ORDER, fill_value=0)
+    summary = pd.DataFrame({
+        "Month": MONTH_ORDER,
+        "Years w/ high": high_counts.values,
+        "% high": (high_counts.values / n * 100).round(0).astype(int),
+        "Years w/ low": low_counts.values,
+        "% low": (low_counts.values / n * 100).round(0).astype(int),
+    })
+    return per_year, summary, excluded
 
 
 def plotly_config(filename: str) -> dict:
@@ -530,12 +636,93 @@ def render_spread_matrix(commodity: dict, api_key: str, as_of: date):
     export_row(display, f"spread_matrix_{key}", key=f"mx_{key}")
 
 
+CONTINUOUS_FREQ = {"Daily": None, "Weekly": "W-FRI", "Monthly": "ME"}
+
+
+def render_continuous_chart(commodity: dict, api_key: str, as_of: date):
+    code = commodity["product_code"]
+    key = commodity["key"]
+    unit = commodity["unit"]
+
+    try:
+        curve = load_curve(code, api_key, as_of.isoformat(), 15)
+    except MassiveApiError as e:
+        st.error(f"Couldn't load {commodity['label']} quotes: {e}")
+        return
+
+    series = build_continuous_series(code, api_key, as_of.isoformat(), curve)
+    if not len(series):
+        st.warning(f"{commodity['label']}: no continuous history available.")
+        return
+
+    freq_label = st.segmented_control(
+        "Bar interval", list(CONTINUOUS_FREQ), default="Daily", key=f"cont_freq_{key}",
+    )
+    rule = CONTINUOUS_FREQ.get(freq_label or "Daily")
+
+    st.caption(
+        f"Unadjusted nearby continuous {commodity['label']} — splices each front-month contract's "
+        "settlements together at roll (its last trading day), so a small gap can appear where the new "
+        "front month settled at a different level. Not back-adjusted."
+    )
+
+    fig = go.Figure()
+    if rule is None:
+        fig.add_trace(go.Scatter(
+            x=list(series.index), y=list(series.values), mode="lines", name="Nearby",
+            line=dict(color=YEAR_COLORS[0], width=1.5),
+            hovertemplate="%{x|%b %d, %Y}<br>%{y:.3f}<extra></extra>",
+        ))
+    else:
+        ohlc = resample_ohlc(series, rule)
+        fig.add_trace(go.Candlestick(
+            x=list(ohlc.index), open=ohlc["open"], high=ohlc["high"], low=ohlc["low"], close=ohlc["close"],
+            increasing_line_color=UP_COLOR, decreasing_line_color=DOWN_COLOR, name="Nearby",
+        ))
+        fig.update_layout(xaxis_rangeslider_visible=False)
+    _style_axes(fig, f"Price ({unit})", None, height=440)
+    fig.update_layout(showlegend=False)
+    st.plotly_chart(fig, width="stretch", key=f"cont_chart_{key}",
+                    config=plotly_config(f"{key}_continuous_{freq_label}"))
+    export_row(series.rename("price").reset_index().rename(columns={"index": "date"}),
+               f"{key}_continuous_{freq_label}", key=f"cont_{key}")
+
+    st.divider()
+    st.caption(f"**{commodity['label']}** — historical highs & lows by calendar month (nearby continuous)")
+    per_year, summary, excluded = highs_lows_by_month(series)
+    if per_year.empty:
+        st.info("Not enough continuous history yet to compute yearly highs and lows.")
+        return
+
+    display_year = per_year.copy()
+    display_year["High price"] = display_year["High price"].map(lambda v: f"{v:.3f}")
+    display_year["Low price"] = display_year["Low price"].map(lambda v: f"{v:.3f}")
+    display_year = display_year[["Year", "High date", "High price", "Low date", "Low price"]]
+    st.dataframe(display_year, hide_index=True, width="stretch")
+    export_row(display_year, f"{key}_yearly_highlow", key=f"yrhl_{key}")
+
+    if not summary.empty:
+        note = f"Frequency across {len(per_year) - len(excluded)} complete calendar year"
+        note += "s" if (len(per_year) - len(excluded)) != 1 else ""
+        if excluded:
+            note += f" (excludes partial year{'s' if len(excluded) != 1 else ''} {', '.join(map(str, excluded))})"
+        st.caption(note + ".")
+        st.dataframe(summary, hide_index=True, width="stretch")
+        export_row(summary, f"{key}_month_frequency", key=f"mf_{key}")
+    else:
+        st.info("Not enough complete calendar years yet to compute a month-frequency summary.")
+
+
 def render_commodity(commodity: dict, api_key: str, as_of: date):
-    tab_futures, tab_spread, tab_matrix = st.tabs(["Seasonal futures", "Seasonal spread", "Spread matrix"])
+    tab_futures, tab_spread, tab_matrix, tab_continuous = st.tabs(
+        ["Seasonal futures", "Seasonal spread", "Spread matrix", "Continuous chart"]
+    )
     with tab_futures:
         render_seasonal_futures(commodity, api_key, as_of)
     with tab_spread:
         render_seasonal_spread(commodity, api_key, as_of)
+    with tab_continuous:
+        render_continuous_chart(commodity, api_key, as_of)
     with tab_matrix:
         render_spread_matrix(commodity, api_key, as_of)
 
