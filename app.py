@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 from massive_api import MassiveApiError, get_futures_curve, get_settlement_histories
@@ -84,6 +85,105 @@ def live_cattle_fnd(delivery_month: date) -> date:
     first_of_month = pd.Timestamp(year=delivery_month.year, month=delivery_month.month, day=1)
     first_friday = first_of_month + pd.Timedelta(days=(4 - first_of_month.weekday()) % 7)
     return (first_friday + pd.Timedelta(days=3)).date()
+
+
+# USDA's ESMIS system (esmis.nal.usda.gov) is a public, no-key catalog of every
+# agency report with an exact release_datetime per issue — more authoritative
+# for "when was this report released" than reverse-engineering it from the
+# NASS QuickStats/WASDE data feeds themselves, so report-date markers are
+# sourced from here rather than from NASS_API_KEY or a WASDE data key.
+ESMIS_BASE = "https://esmis.nal.usda.gov/api/v1"
+REPORT_PUBLICATIONS = {
+    "Cattle on Feed": 2270,
+    "Hogs and Pigs": 1474,
+    "Livestock Slaughter": 2233,
+    "WASDE": 1659,
+}
+# Which reports move which commodity: Hogs and Pigs is hog-specific; Cattle on
+# Feed drives both fed-cattle supply and feeder demand; Livestock Slaughter
+# covers cattle and hogs (not a separate feeder cattle count); WASDE's meat
+# production/outlook tables touch all three loosely.
+REPORT_RELEVANCE = {
+    "LE": ["Cattle on Feed", "Livestock Slaughter", "WASDE"],
+    "GF": ["Cattle on Feed", "WASDE"],
+    "HE": ["Hogs and Pigs", "Livestock Slaughter", "WASDE"],
+}
+REPORT_COLORS = {
+    "Cattle on Feed": "#795548",
+    "Hogs and Pigs": "#ff9800",
+    "Livestock Slaughter": "#009688",
+    "WASDE": "#607d8b",
+}
+
+
+@st.cache_data(ttl="24h", show_spinner=False)
+def fetch_report_dates(report: str, since: str) -> list[date]:
+    """Release dates for a USDA report since a cutoff date, newest-first
+    pagination stopped as soon as a page is entirely before the cutoff —
+    typically 1-4 requests rather than the report's full multi-decade history."""
+    pub_id = REPORT_PUBLICATIONS[report]
+    since_date = date.fromisoformat(since)
+    dates: list[date] = []
+    page = 0
+    while page < 40:
+        try:
+            resp = requests.get(f"{ESMIS_BASE}/release/findByPubId/{pub_id}",
+                                params={"page": page}, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException:
+            break
+        results = data.get("results", [])
+        if not results:
+            break
+        any_recent = False
+        for r in results:
+            dt_str = r.get("release_datetime")
+            if not dt_str:
+                continue
+            d = pd.to_datetime(dt_str).date()
+            if d >= since_date:
+                dates.append(d)
+                any_recent = True
+        if not any_recent:
+            break
+        page += 1
+        if page >= data.get("pager", {}).get("total_pages", page + 1):
+            break
+    return sorted(set(dates))
+
+
+REPORT_COLOR_NAMES = {
+    "Cattle on Feed": "brown",
+    "Hogs and Pigs": "orange",
+    "Livestock Slaughter": "teal",
+    "WASDE": "blue-grey",
+}
+
+
+def relevant_report_dates(code: str, as_of: date) -> dict[str, list[date]]:
+    """Report dates for the commodities that report moves, over a fixed 2-year
+    lookback (cached independent of the chart's own window selector so
+    switching 6M/1Y/18M doesn't refetch)."""
+    since = (as_of - timedelta(days=730)).isoformat()
+    return {r: fetch_report_dates(r, since) for r in REPORT_RELEVANCE.get(code, [])}
+
+
+def add_report_vlines(fig, dates_by_report: dict[str, list[date]], start: date, end: date):
+    """Thin, unlabeled dotted markers — a report's release date, not a price
+    level, so no annotation text is drawn to keep the chart from getting
+    cluttered by four report types' worth of monthly/quarterly dates."""
+    for report, dates in dates_by_report.items():
+        color = REPORT_COLORS[report]
+        for d in dates:
+            if start <= d <= end:
+                fig.add_shape(type="line", xref="x", yref="paper", x0=d, x1=d, y0=0, y1=1,
+                              line=dict(color=color, dash="dot", width=1), opacity=0.55)
+
+
+def report_legend_caption(code: str) -> str:
+    parts = [f"{r} ({REPORT_COLOR_NAMES[r]})" for r in REPORT_RELEVANCE.get(code, [])]
+    return "Dotted vertical lines mark USDA report release dates: " + ", ".join(parts) + "."
 
 
 def get_api_key() -> str:
@@ -344,12 +444,15 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
                                  "very different price levels can be compared on shape alone.")
         show_avg = st.toggle("Average", value=True, key=f"fut_avg_{key}")
         window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key=f"fut_win_{key}")
+        show_reports = st.toggle("Report dates", value=True, key=f"fut_rpt_{key}",
+                                 help="USDA report release dates relevant to this market.")
 
     window_days = WINDOW_CHOICES.get(window_label or "1Y", 365)
     anchor_expiry = expiries[ticker]
     label = friendly_contract(ticker, code)
     y_title = "Index (start = 100)" if indexed else f"Price ({unit})"
     fmt = ".1f" if indexed else ".3f"
+    report_dates = relevant_report_dates(code, as_of) if show_reports else {}
 
     shifted = [shift_ticker_year(ticker, code, -b) for b in range(years_back + 1)]
     shifted = [t for t in shifted if t]
@@ -375,18 +478,23 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
                 _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
                 if code == "LE":
                     _add_vline(fig, live_cattle_fnd(anchor_expiry), "FND", FND_COLOR)
+            if report_dates:
+                add_report_vlines(fig, report_dates, shown.index.min(), shown.index.max())
             _style_axes(fig, f"Price ({unit})", None)
             fig.update_layout(showlegend=False)
             st.plotly_chart(fig, width="stretch", key=f"fut_hist_{key}",
                             config=plotly_config(f"{key}_{ticker}_history"))
             export_row(shown.rename("price").reset_index().rename(columns={"index": "date"}),
                        f"{key}_{ticker}_history", key=f"futhist_{key}")
+            if report_dates:
+                st.caption(report_legend_caption(code))
 
     st.caption(f"**{label}** — seasonal, aligned on expiration")
     fig = go.Figure()
     by_dte: dict[str, pd.Series] = {}
     skipped: list[str] = []
 
+    current_year_range = None
     for back in range(years_back + 1):
         t = shift_ticker_year(ticker, code, -back)
         if not t:
@@ -412,6 +520,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
 
         xs_dte = [dte[i] for i in keep]
         xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
+        if back == 0:
+            current_year_range = (min(xs), max(xs))
         name = t + (" (current)" if back == 0 else "")
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines", name=name,
@@ -437,6 +547,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
             _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
             if code == "LE":
                 _add_vline(fig, live_cattle_fnd(anchor_expiry), "FND", FND_COLOR)
+        if report_dates and current_year_range:
+            add_report_vlines(fig, report_dates, *current_year_range)
         _style_axes(fig, y_title, None)
         st.plotly_chart(fig, width="stretch", key=f"fut_seas_{key}",
                         config=plotly_config(f"{key}_{ticker}_seasonal"))
@@ -449,6 +561,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
         if skipped:
             note += f" No usable history for {', '.join(skipped)}."
         st.caption(note)
+        if report_dates:
+            st.caption(report_legend_caption(code) + " (current year only.)")
 
 
 def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
@@ -478,6 +592,8 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
         years_back = st.slider("Prior years", 1, MAX_YEARS_BACK, 4, key=f"sp_years_{key}", width=170)
         show_avg = st.toggle("Average", value=True, key=f"sp_avg_{key}")
         window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key=f"sp_win_{key}")
+        show_reports = st.toggle("Report dates", value=True, key=f"sp_rpt_{key}",
+                                 help="USDA report release dates relevant to this market.")
 
     if not far:
         st.info("Pick a far leg that expires after the near leg.")
@@ -487,6 +603,7 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
     anchor_expiry = expiries[near]
     label = f"{friendly_contract(near, code)} / {friendly_contract(far, code)}"
     y_title = f"Spread ({unit})"
+    report_dates = relevant_report_dates(code, as_of) if show_reports else {}
 
     shifted_pairs = []
     for back in range(years_back + 1):
@@ -514,18 +631,23 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
                 line=dict(color=YEAR_COLORS[0], width=2),
                 hovertemplate="%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
             ))
+            if report_dates:
+                add_report_vlines(fig, report_dates, shown.index.min(), shown.index.max())
             _style_axes(fig, y_title, None)
             fig.update_layout(showlegend=False)
             st.plotly_chart(fig, width="stretch", key=f"sp_hist_{key}",
                             config=plotly_config(f"{key}_{near}_{far}_history"))
             export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
                        f"{key}_{near}_{far}_history", key=f"sphist_{key}")
+            if report_dates:
+                st.caption(report_legend_caption(code))
 
     st.caption(f"**{label}** — seasonal, aligned on near-leg expiration")
     fig = go.Figure()
     by_dte: dict[str, pd.Series] = {}
     skipped: list[str] = []
 
+    current_year_range = None
     for back, (n, f) in enumerate(shifted_pairs):
         n_h, f_h = hist.get(n), hist.get(f)
         if n_h is None or f_h is None or not len(n_h) or not len(f_h):
@@ -544,6 +666,8 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
 
         xs_dte = [dte[i] for i in keep]
         xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
+        if back == 0:
+            current_year_range = (min(xs), max(xs))
         ys = [spread.values[i] for i in keep]
         name = f"{n}/{f}" + (" (current)" if back == 0 else "")
         fig.add_trace(go.Scatter(
@@ -570,6 +694,8 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
             _add_vline(fig, anchor_expiry, "near expiration", EXP_COLOR)
             if code == "LE":
                 _add_vline(fig, live_cattle_fnd(anchor_expiry), "near FND", FND_COLOR)
+        if report_dates and current_year_range:
+            add_report_vlines(fig, report_dates, *current_year_range)
         _style_axes(fig, y_title, None)
         st.plotly_chart(fig, width="stretch", key=f"sp_seas_{key}",
                         config=plotly_config(f"{key}_{near}_{far}_seasonal"))
@@ -582,6 +708,8 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
         if skipped:
             note += f" No usable history for {', '.join(skipped)}."
         st.caption(note)
+        if report_dates:
+            st.caption(report_legend_caption(code) + " (current year only.)")
 
 
 def build_spread_matrix(curve: pd.DataFrame, code: str) -> tuple[pd.DataFrame, list[str]]:
@@ -711,6 +839,26 @@ def render_continuous_chart(commodity: dict, api_key: str, as_of: date):
         export_row(summary, f"{key}_month_frequency", key=f"mf_{key}")
     else:
         st.info("Not enough complete calendar years yet to compute a month-frequency summary.")
+
+    st.divider()
+    st.caption(f"**{commodity['label']}** — USDA report release calendar")
+    st.caption(
+        "Skipped as chart markers here — at monthly/quarterly cadence over this much history they'd "
+        "read as a solid grid rather than a signal. Shown as a table instead, over the same span as "
+        "the chart above."
+    )
+    reports = REPORT_RELEVANCE.get(code, [])
+    since = series.index.min().date().isoformat()
+    rows = []
+    for report in reports:
+        for d in fetch_report_dates(report, since):
+            rows.append({"Date": d, "Report": report})
+    if not rows:
+        st.info("No report dates available for this range.")
+    else:
+        calendar = pd.DataFrame(rows).sort_values("Date", ascending=False).reset_index(drop=True)
+        st.dataframe(calendar, hide_index=True, width="stretch", height=min(35 * (len(calendar) + 1) + 3, 400))
+        export_row(calendar, f"{key}_report_calendar", key=f"rptcal_{key}")
 
 
 def render_commodity(commodity: dict, api_key: str, as_of: date):
