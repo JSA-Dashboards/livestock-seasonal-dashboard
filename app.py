@@ -156,7 +156,7 @@ def _add_vline(fig, x, text, color):
                        yanchor="bottom", font=dict(size=10, color=color))
 
 
-def _style_axes(fig, y_title, x_title, height=340):
+def _style_axes(fig, y_title, x_title, height=420):
     wm = watermark_path()
     if wm:
         fig.add_layout_image(dict(
@@ -233,100 +233,96 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
     shifted = [t for t in shifted if t]
     hist = load_histories(tuple(shifted), api_key)
 
-    left, right = st.columns(2)
-
-    with left:
-        st.caption(f"**{label}** — recent history")
-        current = hist.get(ticker)
-        if current is None or not len(current):
-            st.info("No settlement history for this contract yet.")
+    st.caption(f"**{label}** — recent history")
+    current = hist.get(ticker)
+    if current is None or not len(current):
+        st.info("No settlement history for this contract yet.")
+    else:
+        cutoff = as_of - timedelta(days=window_days)
+        shown = current[current.index >= cutoff]
+        if not len(shown):
+            st.info(f"No sessions inside the {window_label} window.")
         else:
-            cutoff = as_of - timedelta(days=window_days)
-            shown = current[current.index >= cutoff]
-            if not len(shown):
-                st.info(f"No sessions inside the {window_label} window.")
-            else:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=list(shown.index), y=list(shown.values), mode="lines", name=label,
-                    line=dict(color=YEAR_COLORS[0], width=2),
-                    hovertemplate="%{x|%b %d, %Y}<br>%{y:.3f}<extra></extra>",
-                ))
-                if as_of <= anchor_expiry:
-                    _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
-                _style_axes(fig, f"Price ({unit})", None)
-                fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, width="stretch", key=f"fut_hist_{key}",
-                                config=plotly_config(f"{key}_{ticker}_history"))
-                export_row(shown.rename("price").reset_index().rename(columns={"index": "date"}),
-                           f"{key}_{ticker}_history", key=f"futhist_{key}")
-
-    with right:
-        st.caption(f"**{label}** — seasonal, aligned on expiration")
-        fig = go.Figure()
-        by_dte: dict[str, pd.Series] = {}
-        skipped: list[str] = []
-
-        for back in range(years_back + 1):
-            t = shift_ticker_year(ticker, code, -back)
-            if not t:
-                continue
-            series = hist.get(t)
-            if series is None or not len(series):
-                skipped.append(t)
-                continue
-            year_expiry = expiries.get(t, series.index.max())
-            dte = [-(year_expiry - d).days for d in series.index]
-            keep = [i for i, d in enumerate(dte) if d >= -window_days]
-            if not keep:
-                skipped.append(t)
-                continue
-
-            ys = [series.values[i] for i in keep]
-            if indexed:
-                base = ys[0]
-                if not base:
-                    skipped.append(t)
-                    continue
-                ys = [y / base * 100 for y in ys]
-
-            xs_dte = [dte[i] for i in keep]
-            xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
-            name = t + (" (current)" if back == 0 else "")
+            fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=xs, y=ys, mode="lines", name=name,
-                line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
-                opacity=1.0 if back == 0 else 0.75,
-                hovertemplate=f"{name}<br>%{{y:{fmt}}}<extra></extra>",
+                x=list(shown.index), y=list(shown.values), mode="lines", name=label,
+                line=dict(color=YEAR_COLORS[0], width=2),
+                hovertemplate="%{x|%b %d, %Y}<br>%{y:.3f}<extra></extra>",
             ))
-            by_dte[t] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
-
-        if not by_dte:
-            st.info("No settlement history available for this contract's prior-year analogs.")
-        else:
-            if show_avg and len(by_dte) > 1:
-                avg = _year_grid_average(by_dte, window_days)
-                if len(avg):
-                    fig.add_trace(go.Scatter(
-                        x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
-                        y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
-                        line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
-                        hovertemplate=f"Avg<br>%{{y:{fmt}}}<extra></extra>",
-                    ))
             if as_of <= anchor_expiry:
                 _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
-            _style_axes(fig, y_title, None)
-            st.plotly_chart(fig, width="stretch", key=f"fut_seas_{key}",
-                            config=plotly_config(f"{key}_{ticker}_seasonal"))
-            export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
-                       f"{key}_{ticker}_seasonal", key=f"futseas_{key}")
-            note = (
-                f"{len(by_dte)} contract year{'s' if len(by_dte) != 1 else ''} overlaid · x = 0 is "
-                f"{label}'s expiration, so every year lines up at the same point in its life."
-            )
-            if skipped:
-                note += f" No usable history for {', '.join(skipped)}."
-            st.caption(note)
+            _style_axes(fig, f"Price ({unit})", None)
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, width="stretch", key=f"fut_hist_{key}",
+                            config=plotly_config(f"{key}_{ticker}_history"))
+            export_row(shown.rename("price").reset_index().rename(columns={"index": "date"}),
+                       f"{key}_{ticker}_history", key=f"futhist_{key}")
+
+    st.caption(f"**{label}** — seasonal, aligned on expiration")
+    fig = go.Figure()
+    by_dte: dict[str, pd.Series] = {}
+    skipped: list[str] = []
+
+    for back in range(years_back + 1):
+        t = shift_ticker_year(ticker, code, -back)
+        if not t:
+            continue
+        series = hist.get(t)
+        if series is None or not len(series):
+            skipped.append(t)
+            continue
+        year_expiry = expiries.get(t, series.index.max())
+        dte = [-(year_expiry - d).days for d in series.index]
+        keep = [i for i, d in enumerate(dte) if d >= -window_days]
+        if not keep:
+            skipped.append(t)
+            continue
+
+        ys = [series.values[i] for i in keep]
+        if indexed:
+            base = ys[0]
+            if not base:
+                skipped.append(t)
+                continue
+            ys = [y / base * 100 for y in ys]
+
+        xs_dte = [dte[i] for i in keep]
+        xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
+        name = t + (" (current)" if back == 0 else "")
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=name,
+            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
+            opacity=1.0 if back == 0 else 0.75,
+            hovertemplate=f"{name}<br>%{{y:{fmt}}}<extra></extra>",
+        ))
+        by_dte[t] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
+
+    if not by_dte:
+        st.info("No settlement history available for this contract's prior-year analogs.")
+    else:
+        if show_avg and len(by_dte) > 1:
+            avg = _year_grid_average(by_dte, window_days)
+            if len(avg):
+                fig.add_trace(go.Scatter(
+                    x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
+                    y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
+                    line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
+                    hovertemplate=f"Avg<br>%{{y:{fmt}}}<extra></extra>",
+                ))
+        if as_of <= anchor_expiry:
+            _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
+        _style_axes(fig, y_title, None)
+        st.plotly_chart(fig, width="stretch", key=f"fut_seas_{key}",
+                        config=plotly_config(f"{key}_{ticker}_seasonal"))
+        export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
+                   f"{key}_{ticker}_seasonal", key=f"futseas_{key}")
+        note = (
+            f"{len(by_dte)} contract year{'s' if len(by_dte) != 1 else ''} overlaid · x = 0 is "
+            f"{label}'s expiration, so every year lines up at the same point in its life."
+        )
+        if skipped:
+            note += f" No usable history for {', '.join(skipped)}."
+        st.caption(note)
 
 
 def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
@@ -375,93 +371,89 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
     tickers_needed = tuple(sorted({t for pair in shifted_pairs for t in pair}))
     hist = load_histories(tickers_needed, api_key)
 
-    left, right = st.columns(2)
-
-    with left:
-        st.caption(f"**{label}** — recent history")
-        near_h, far_h = hist.get(near), hist.get(far)
-        if near_h is None or far_h is None or not len(near_h) or not len(far_h):
-            st.info("No overlapping settlement history for this pair.")
+    st.caption(f"**{label}** — recent history")
+    near_h, far_h = hist.get(near), hist.get(far)
+    if near_h is None or far_h is None or not len(near_h) or not len(far_h):
+        st.info("No overlapping settlement history for this pair.")
+    else:
+        spread = (near_h - far_h).dropna()
+        cutoff = as_of - timedelta(days=window_days)
+        shown = spread[spread.index >= cutoff]
+        if not len(shown):
+            st.info(f"No sessions inside the {window_label} window.")
         else:
-            spread = (near_h - far_h).dropna()
-            cutoff = as_of - timedelta(days=window_days)
-            shown = spread[spread.index >= cutoff]
-            if not len(shown):
-                st.info(f"No sessions inside the {window_label} window.")
-            else:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=list(shown.index), y=list(shown.values), mode="lines", name=label,
-                    line=dict(color=YEAR_COLORS[0], width=2),
-                    hovertemplate="%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
-                ))
-                _style_axes(fig, y_title, None)
-                fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, width="stretch", key=f"sp_hist_{key}",
-                                config=plotly_config(f"{key}_{near}_{far}_history"))
-                export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
-                           f"{key}_{near}_{far}_history", key=f"sphist_{key}")
-
-    with right:
-        st.caption(f"**{label}** — seasonal, aligned on near-leg expiration")
-        fig = go.Figure()
-        by_dte: dict[str, pd.Series] = {}
-        skipped: list[str] = []
-
-        for back, (n, f) in enumerate(shifted_pairs):
-            n_h, f_h = hist.get(n), hist.get(f)
-            if n_h is None or f_h is None or not len(n_h) or not len(f_h):
-                skipped.append(f"{n}/{f}")
-                continue
-            spread = (n_h - f_h).dropna()
-            if not len(spread):
-                skipped.append(f"{n}/{f}")
-                continue
-            near_expiry = expiries.get(n, n_h.index.max())
-            dte = [-(near_expiry - d).days for d in spread.index]
-            keep = [i for i, d in enumerate(dte) if d >= -window_days]
-            if not keep:
-                skipped.append(f"{n}/{f}")
-                continue
-
-            xs_dte = [dte[i] for i in keep]
-            xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
-            ys = [spread.values[i] for i in keep]
-            name = f"{n}/{f}" + (" (current)" if back == 0 else "")
+            fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=xs, y=ys, mode="lines", name=name,
-                line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
-                opacity=1.0 if back == 0 else 0.75,
-                hovertemplate=f"{name}<br>%{{y:+.3f}}<extra></extra>",
+                x=list(shown.index), y=list(shown.values), mode="lines", name=label,
+                line=dict(color=YEAR_COLORS[0], width=2),
+                hovertemplate="%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
             ))
-            by_dte[f"{n}/{f}"] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
-
-        if not by_dte:
-            st.info("No overlapping settlement history for this pair's prior-year analogs.")
-        else:
-            if show_avg and len(by_dte) > 1:
-                avg = _year_grid_average(by_dte, window_days)
-                if len(avg):
-                    fig.add_trace(go.Scatter(
-                        x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
-                        y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
-                        line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
-                        hovertemplate="Avg<br>%{y:+.3f}<extra></extra>",
-                    ))
-            if as_of <= anchor_expiry:
-                _add_vline(fig, anchor_expiry, "near expiration", EXP_COLOR)
             _style_axes(fig, y_title, None)
-            st.plotly_chart(fig, width="stretch", key=f"sp_seas_{key}",
-                            config=plotly_config(f"{key}_{near}_{far}_seasonal"))
-            export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
-                       f"{key}_{near}_{far}_seasonal", key=f"spseas_{key}")
-            note = (
-                f"{len(by_dte)} contract year{'s' if len(by_dte) != 1 else ''} overlaid · x = 0 is "
-                f"the near leg's expiration, so every year lines up at the same point in its life."
-            )
-            if skipped:
-                note += f" No usable history for {', '.join(skipped)}."
-            st.caption(note)
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, width="stretch", key=f"sp_hist_{key}",
+                            config=plotly_config(f"{key}_{near}_{far}_history"))
+            export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
+                       f"{key}_{near}_{far}_history", key=f"sphist_{key}")
+
+    st.caption(f"**{label}** — seasonal, aligned on near-leg expiration")
+    fig = go.Figure()
+    by_dte: dict[str, pd.Series] = {}
+    skipped: list[str] = []
+
+    for back, (n, f) in enumerate(shifted_pairs):
+        n_h, f_h = hist.get(n), hist.get(f)
+        if n_h is None or f_h is None or not len(n_h) or not len(f_h):
+            skipped.append(f"{n}/{f}")
+            continue
+        spread = (n_h - f_h).dropna()
+        if not len(spread):
+            skipped.append(f"{n}/{f}")
+            continue
+        near_expiry = expiries.get(n, n_h.index.max())
+        dte = [-(near_expiry - d).days for d in spread.index]
+        keep = [i for i, d in enumerate(dte) if d >= -window_days]
+        if not keep:
+            skipped.append(f"{n}/{f}")
+            continue
+
+        xs_dte = [dte[i] for i in keep]
+        xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
+        ys = [spread.values[i] for i in keep]
+        name = f"{n}/{f}" + (" (current)" if back == 0 else "")
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=name,
+            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
+            opacity=1.0 if back == 0 else 0.75,
+            hovertemplate=f"{name}<br>%{{y:+.3f}}<extra></extra>",
+        ))
+        by_dte[f"{n}/{f}"] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
+
+    if not by_dte:
+        st.info("No overlapping settlement history for this pair's prior-year analogs.")
+    else:
+        if show_avg and len(by_dte) > 1:
+            avg = _year_grid_average(by_dte, window_days)
+            if len(avg):
+                fig.add_trace(go.Scatter(
+                    x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
+                    y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
+                    line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
+                    hovertemplate="Avg<br>%{y:+.3f}<extra></extra>",
+                ))
+        if as_of <= anchor_expiry:
+            _add_vline(fig, anchor_expiry, "near expiration", EXP_COLOR)
+        _style_axes(fig, y_title, None)
+        st.plotly_chart(fig, width="stretch", key=f"sp_seas_{key}",
+                        config=plotly_config(f"{key}_{near}_{far}_seasonal"))
+        export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
+                   f"{key}_{near}_{far}_seasonal", key=f"spseas_{key}")
+        note = (
+            f"{len(by_dte)} contract year{'s' if len(by_dte) != 1 else ''} overlaid · x = 0 is "
+            f"the near leg's expiration, so every year lines up at the same point in its life."
+        )
+        if skipped:
+            note += f" No usable history for {', '.join(skipped)}."
+        st.caption(note)
 
 
 def build_spread_matrix(curve: pd.DataFrame, code: str) -> tuple[pd.DataFrame, list[str]]:
