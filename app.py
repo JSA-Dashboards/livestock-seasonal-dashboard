@@ -1358,7 +1358,10 @@ def tool_get_calendar_spread(massive_key: str, as_of: date, commodity: str,
         return {"error": "No overlapping settlement history for this pair."}
     spread = (near_h - far_h).dropna()
     days_back = max(5, min(int(days_back or 180), 1800))
-    cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=days_back)
+    # near_h/far_h come straight from load_histories, indexed by plain date
+    # objects (unlike build_continuous_series's DatetimeIndex) — a pd.Timestamp
+    # cutoff here raises TypeError comparing Timestamp to date.
+    cutoff = as_of - timedelta(days=days_back)
     window = spread[spread.index >= cutoff]
     if not len(window):
         window = spread
@@ -1368,11 +1371,13 @@ def tool_get_calendar_spread(massive_key: str, as_of: date, commodity: str,
         "near_leg": friendly_contract(near_t, code),
         "far_leg": friendly_contract(far_t, code),
         "current_spread": round(float(window.iloc[-1]), 3),
-        "as_of": str(window.index.max().date()),
+        # window's index is already a plain date (from load_histories), not a
+        # Timestamp — no .date() call needed, unlike the continuous-series tools.
+        "as_of": str(window.index.max()),
         "window_high": round(float(window.max()), 3),
-        "window_high_date": str(window.idxmax().date()),
+        "window_high_date": str(window.idxmax()),
         "window_low": round(float(window.min()), 3),
-        "window_low_date": str(window.idxmin().date()),
+        "window_low_date": str(window.idxmin()),
         "sessions": int(len(window)),
     }
 
