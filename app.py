@@ -54,13 +54,29 @@ MONTH_LETTERS = {
 YEAR_COLORS = ["#0693e3", "#e8833a", "#5aa469", "#b05fb0", "#9aa5b1", "#c0392b"]
 AVG_COLOR = "#111111"
 EXP_COLOR = "#c62828"
+FND_COLOR = "#8e24aa"
 MAX_YEARS_BACK = 5
 DATA_START_NOTE = (
     "Massive's daily settlement history starts 2021-09-02, so seasonal overlays "
     "cover roughly the last 4 full contract years — older analogs are skipped, not wrong."
 )
+FND_NOTE = (
+    "FND marks CME's Live Cattle First Notice Day — the first Monday following the "
+    "first Friday of the contract month (Rulebook Ch. 101). Feeder Cattle and Lean "
+    "Hogs are cash-settled with no physical delivery, so no FND applies to them."
+)
 
 GROUP_BAND = "background-color:#EAF7EA;"
+
+
+def live_cattle_fnd(delivery_month: date) -> date:
+    """CME Live Cattle First Notice Day: the first Monday following the first
+    Friday of the delivery (contract) month. Only Live Cattle (LE) is
+    physically delivered — Feeder Cattle and Lean Hogs are cash-settled
+    against an index and have no FND."""
+    first_of_month = pd.Timestamp(year=delivery_month.year, month=delivery_month.month, day=1)
+    first_friday = first_of_month + pd.Timedelta(days=(4 - first_of_month.weekday()) % 7)
+    return (first_friday + pd.Timedelta(days=3)).date()
 
 
 def get_api_key() -> str:
@@ -251,6 +267,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
             ))
             if as_of <= anchor_expiry:
                 _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
+                if code == "LE":
+                    _add_vline(fig, live_cattle_fnd(anchor_expiry), "FND", FND_COLOR)
             _style_axes(fig, f"Price ({unit})", None)
             fig.update_layout(showlegend=False)
             st.plotly_chart(fig, width="stretch", key=f"fut_hist_{key}",
@@ -311,6 +329,8 @@ def render_seasonal_futures(commodity: dict, api_key: str, as_of: date):
                 ))
         if as_of <= anchor_expiry:
             _add_vline(fig, anchor_expiry, "expiration", EXP_COLOR)
+            if code == "LE":
+                _add_vline(fig, live_cattle_fnd(anchor_expiry), "FND", FND_COLOR)
         _style_axes(fig, y_title, None)
         st.plotly_chart(fig, width="stretch", key=f"fut_seas_{key}",
                         config=plotly_config(f"{key}_{ticker}_seasonal"))
@@ -442,6 +462,8 @@ def render_seasonal_spread(commodity: dict, api_key: str, as_of: date):
                 ))
         if as_of <= anchor_expiry:
             _add_vline(fig, anchor_expiry, "near expiration", EXP_COLOR)
+            if code == "LE":
+                _add_vline(fig, live_cattle_fnd(anchor_expiry), "near FND", FND_COLOR)
         _style_axes(fig, y_title, None)
         st.plotly_chart(fig, width="stretch", key=f"sp_seas_{key}",
                         config=plotly_config(f"{key}_{near}_{far}_seasonal"))
@@ -545,6 +567,8 @@ def main():
     for tab, commodity in zip(tabs, COMMODITIES):
         with tab:
             st.caption(commodity["sublabel"])
+            if commodity["product_code"] == "LE":
+                st.caption(FND_NOTE)
             render_commodity(commodity, api_key, as_of)
 
 
