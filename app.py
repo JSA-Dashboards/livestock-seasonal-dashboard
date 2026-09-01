@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1098,6 +1099,400 @@ def render_spread_builder(api_key: str, as_of: date):
         st.caption(note)
 
 
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+CHAT_MAX_TOKENS = 1024
+CHAT_MAX_TOOL_ROUNDS = 5
+CHAT_MAX_MESSAGES = 40  # user+assistant combined, a cost backstop behind the passphrase gate
+
+CHAT_SYSTEM_PROMPT = (
+    "You are a data assistant for JSA's Livestock Seasonal Futures & Spreads dashboard, "
+    "covering CME Live Cattle, Feeder Cattle, and Lean Hogs futures. Answer questions about "
+    "pricing history and this dashboard's data using the tools provided — never state a "
+    "specific price, date, or statistic without having just looked it up via a tool call in "
+    "this turn. If a tool returns an error, say so plainly rather than guessing or falling "
+    "back on general knowledge. Quotes are delayed per the Massive API; report dates come "
+    "from USDA's ESMIS release calendar. Keep answers concise and reference the actual numbers "
+    "you pulled. You are not a licensed financial advisor — report what the data shows, don't "
+    "give trading or investment advice."
+)
+
+CHAT_TOOLS = [
+    {
+        "name": "get_price_series",
+        "description": (
+            "Recent continuous nearby futures price for a livestock commodity: latest price, "
+            "price at the start of the window, change, and the high/low over that window."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "commodity": {"type": "string", "description": "Live Cattle, Feeder Cattle, or Lean Hogs (or LE/GF/HE)."},
+                "days_back": {"type": "integer", "description": "Lookback window in days (default 90, max 1800)."},
+            },
+            "required": ["commodity"],
+        },
+    },
+    {
+        "name": "get_seasonal_stats",
+        "description": (
+            "Per calendar year, when the annual high and low settled for a livestock "
+            "commodity's continuous nearby series, plus a month-frequency summary across "
+            "complete calendar years."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"commodity": {"type": "string", "description": "Live Cattle, Feeder Cattle, or Lean Hogs."}},
+            "required": ["commodity"],
+        },
+    },
+    {
+        "name": "get_report_dates",
+        "description": (
+            "Most recent USDA report release dates relevant to a livestock commodity (Cattle "
+            "on Feed, Hogs and Pigs, Livestock Slaughter, WASDE), from USDA's official ESMIS "
+            "release calendar."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "commodity": {"type": "string", "description": "Live Cattle, Feeder Cattle, or Lean Hogs."},
+                "count": {"type": "integer", "description": "How many recent dates per report type (default 8)."},
+            },
+            "required": ["commodity"],
+        },
+    },
+    {
+        "name": "get_current_curve",
+        "description": (
+            "Live CME futures curve for a livestock commodity: every currently-listed "
+            "contract month, its price, and expiration date."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"commodity": {"type": "string", "description": "Live Cattle, Feeder Cattle, or Lean Hogs."}},
+            "required": ["commodity"],
+        },
+    },
+    {
+        "name": "get_calendar_spread",
+        "description": (
+            "Current value and recent history of a calendar spread (near contract month "
+            "minus far contract month) within one livestock commodity."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "commodity": {"type": "string", "description": "Live Cattle, Feeder Cattle, or Lean Hogs."},
+                "near_month": {"type": "string", "description": "Near leg's month, e.g. 'Aug' or 'August'."},
+                "far_month": {"type": "string", "description": "Far leg's month, e.g. 'Oct' or 'October'."},
+                "days_back": {"type": "integer", "description": "History window in days (default 180)."},
+            },
+            "required": ["commodity", "near_month", "far_month"],
+        },
+    },
+]
+
+
+def get_anthropic_key() -> str:
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        key = ""
+    return key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def get_chat_passphrase() -> str:
+    try:
+        phrase = st.secrets.get("CHAT_PASSPHRASE", "")
+    except Exception:
+        phrase = ""
+    return phrase or os.environ.get("CHAT_PASSPHRASE", "")
+
+
+def _normalize_commodity(text: str) -> str | None:
+    t = (text or "").strip().upper()
+    if t in COMMODITY_BY_CODE:
+        return t
+    low = (text or "").strip().lower()
+    if "feeder" in low:
+        return "GF"
+    if "hog" in low or "pork" in low:
+        return "HE"
+    if "live" in low or "cattle" in low or "beef" in low:
+        return "LE"
+    return None
+
+
+def tool_get_price_series(massive_key: str, as_of: date, commodity: str, days_back: int = 90) -> dict:
+    code = _normalize_commodity(commodity)
+    if not code:
+        return {"error": f"Unknown commodity '{commodity}'. Use Live Cattle, Feeder Cattle, or Lean Hogs."}
+    try:
+        curve = load_curve(code, massive_key, as_of.isoformat(), 15)
+        series = build_continuous_series(code, massive_key, as_of.isoformat(), curve)
+    except MassiveApiError as e:
+        return {"error": str(e)}
+    if not len(series):
+        return {"error": "No continuous price history available."}
+    days_back = max(5, min(int(days_back or 90), 1800))
+    cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=days_back)
+    window = series[series.index >= cutoff]
+    if not len(window):
+        window = series
+    latest_price = float(window.iloc[-1])
+    first_price = float(window.iloc[0])
+    return {
+        "commodity": COMMODITY_BY_CODE[code]["label"],
+        "unit": COMMODITY_BY_CODE[code]["unit"],
+        "as_of": str(window.index.max().date()),
+        "latest_price": round(latest_price, 3),
+        "window_start": {"date": str(window.index.min().date()), "price": round(first_price, 3)},
+        "change": round(latest_price - first_price, 3),
+        "pct_change": round((latest_price / first_price - 1) * 100, 2) if first_price else None,
+        "window_high": round(float(window.max()), 3),
+        "window_high_date": str(window.idxmax().date()),
+        "window_low": round(float(window.min()), 3),
+        "window_low_date": str(window.idxmin().date()),
+        "sessions": int(len(window)),
+        "note": "Unadjusted nearby continuous series (front-month splice); quotes delayed per Massive API.",
+    }
+
+
+def tool_get_seasonal_stats(massive_key: str, as_of: date, commodity: str) -> dict:
+    code = _normalize_commodity(commodity)
+    if not code:
+        return {"error": f"Unknown commodity '{commodity}'."}
+    try:
+        curve = load_curve(code, massive_key, as_of.isoformat(), 15)
+        series = build_continuous_series(code, massive_key, as_of.isoformat(), curve)
+    except MassiveApiError as e:
+        return {"error": str(e)}
+    per_year, summary, excluded = highs_lows_by_month(series)
+    if per_year.empty:
+        return {"error": "Not enough continuous history yet."}
+    per_year_out = per_year[["Year", "High date", "High price", "Low date", "Low price", "Complete year"]].copy()
+    per_year_out["High date"] = per_year_out["High date"].astype(str)
+    per_year_out["Low date"] = per_year_out["Low date"].astype(str)
+    result = {
+        "commodity": COMMODITY_BY_CODE[code]["label"],
+        "unit": COMMODITY_BY_CODE[code]["unit"],
+        "per_year": per_year_out.to_dict("records"),
+    }
+    if not summary.empty:
+        result["month_frequency"] = summary.to_dict("records")
+        result["complete_years_counted"] = len(per_year) - len(excluded)
+        result["excluded_partial_years"] = excluded
+    return result
+
+
+def tool_get_report_dates(commodity: str, as_of: date, count: int = 8) -> dict:
+    code = _normalize_commodity(commodity)
+    if not code:
+        return {"error": f"Unknown commodity '{commodity}'."}
+    reports = REPORT_RELEVANCE.get(code, [])
+    since = (as_of - timedelta(days=730)).isoformat()
+    count = max(1, min(int(count or 8), 20))
+    out = {}
+    for r in reports:
+        dates = fetch_report_dates(r, since)
+        out[r] = [str(d) for d in dates[-count:]]
+    return {
+        "commodity": COMMODITY_BY_CODE[code]["label"],
+        "relevant_reports": out,
+        "note": "Dates from USDA's ESMIS release calendar; most recent listed last.",
+    }
+
+
+def tool_get_current_curve(massive_key: str, as_of: date, commodity: str) -> dict:
+    code = _normalize_commodity(commodity)
+    if not code:
+        return {"error": f"Unknown commodity '{commodity}'."}
+    try:
+        curve = load_curve(code, massive_key, as_of.isoformat(), 12)
+    except MassiveApiError as e:
+        return {"error": str(e)}
+    if curve.empty:
+        return {"error": "No live contracts."}
+    rows = [
+        {
+            "contract": friendly_contract(r["ticker"], code),
+            "ticker": r["ticker"],
+            "price": round(float(r["price"]), 3),
+            "expiration": str(r["expiration"]),
+        }
+        for _, r in curve.iterrows()
+    ]
+    return {"commodity": COMMODITY_BY_CODE[code]["label"], "unit": COMMODITY_BY_CODE[code]["unit"], "curve": rows}
+
+
+def tool_get_calendar_spread(massive_key: str, as_of: date, commodity: str,
+                             near_month: str, far_month: str, days_back: int = 180) -> dict:
+    code = _normalize_commodity(commodity)
+    if not code:
+        return {"error": f"Unknown commodity '{commodity}'."}
+    try:
+        curve = load_curve(code, massive_key, as_of.isoformat(), 15)
+    except MassiveApiError as e:
+        return {"error": str(e)}
+    if curve.empty:
+        return {"error": "No live contracts."}
+    tickers = list(curve["ticker"])
+
+    def find_ticker(month_label: str) -> str | None:
+        needle = (month_label or "").strip().lower()[:3]
+        for t in tickers:
+            if friendly_contract(t, code).lower().startswith(needle):
+                return t
+        return None
+
+    near_t, far_t = find_ticker(near_month), find_ticker(far_month)
+    if not near_t or not far_t:
+        return {
+            "error": "Couldn't match both contract months among currently listed contracts.",
+            "currently_listed": [friendly_contract(t, code) for t in tickers],
+        }
+    hist = load_histories((near_t, far_t), massive_key)
+    near_h, far_h = hist.get(near_t), hist.get(far_t)
+    if near_h is None or far_h is None or not len(near_h) or not len(far_h):
+        return {"error": "No overlapping settlement history for this pair."}
+    spread = (near_h - far_h).dropna()
+    days_back = max(5, min(int(days_back or 180), 1800))
+    cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=days_back)
+    window = spread[spread.index >= cutoff]
+    if not len(window):
+        window = spread
+    return {
+        "commodity": COMMODITY_BY_CODE[code]["label"],
+        "unit": COMMODITY_BY_CODE[code]["unit"],
+        "near_leg": friendly_contract(near_t, code),
+        "far_leg": friendly_contract(far_t, code),
+        "current_spread": round(float(window.iloc[-1]), 3),
+        "as_of": str(window.index.max().date()),
+        "window_high": round(float(window.max()), 3),
+        "window_high_date": str(window.idxmax().date()),
+        "window_low": round(float(window.min()), 3),
+        "window_low_date": str(window.idxmin().date()),
+        "sessions": int(len(window)),
+    }
+
+
+def execute_chat_tool(name: str, tool_input: dict, massive_key: str, as_of: date) -> dict:
+    try:
+        if name == "get_price_series":
+            return tool_get_price_series(massive_key, as_of, tool_input.get("commodity", ""),
+                                         tool_input.get("days_back", 90))
+        if name == "get_seasonal_stats":
+            return tool_get_seasonal_stats(massive_key, as_of, tool_input.get("commodity", ""))
+        if name == "get_report_dates":
+            return tool_get_report_dates(tool_input.get("commodity", ""), as_of, tool_input.get("count", 8))
+        if name == "get_current_curve":
+            return tool_get_current_curve(massive_key, as_of, tool_input.get("commodity", ""))
+        if name == "get_calendar_spread":
+            return tool_get_calendar_spread(massive_key, as_of, tool_input.get("commodity", ""),
+                                            tool_input.get("near_month", ""), tool_input.get("far_month", ""),
+                                            tool_input.get("days_back", 180))
+        return {"error": f"Unknown tool '{name}'."}
+    except MassiveApiError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Tool failed: {e}"}
+
+
+def call_anthropic(anthropic_key: str, messages: list) -> dict:
+    resp = requests.post(
+        ANTHROPIC_API_URL,
+        headers={
+            "x-api-key": anthropic_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": CHAT_MAX_TOKENS,
+            "system": CHAT_SYSTEM_PROMPT,
+            "messages": messages,
+            "tools": CHAT_TOOLS,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def run_chat_turn(anthropic_key: str, massive_key: str, as_of: date, history: list) -> str:
+    messages = list(history)
+    for _ in range(CHAT_MAX_TOOL_ROUNDS):
+        data = call_anthropic(anthropic_key, messages)
+        content = data.get("content", [])
+        if data.get("stop_reason") != "tool_use":
+            text = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
+            return text or "(no response)"
+        messages.append({"role": "assistant", "content": content})
+        tool_results = []
+        for block in content:
+            if block.get("type") != "tool_use":
+                continue
+            result = execute_chat_tool(block["name"], block.get("input", {}) or {}, massive_key, as_of)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block["id"],
+                "content": json.dumps(result, default=str),
+            })
+        messages.append({"role": "user", "content": tool_results})
+    return "I couldn't finish looking that up within the allowed number of steps — try a narrower question."
+
+
+def render_chat(massive_key: str, as_of: date):
+    st.caption(
+        "Ask about CME livestock pricing history and this dashboard's data — recent prices, "
+        "seasonal highs/lows, USDA report dates, current curves, calendar spreads. Answers are "
+        "grounded in the same data as the charts above via live tool calls, not general knowledge."
+    )
+
+    anthropic_key = get_anthropic_key()
+    if not anthropic_key:
+        st.error("No ANTHROPIC_API_KEY configured for this app.")
+        return
+
+    passphrase = get_chat_passphrase()
+    if passphrase and not st.session_state.get("chat_unlocked"):
+        entered = st.text_input("Passphrase", type="password", key="chat_pw")
+        if st.button("Unlock", key="chat_unlock_btn"):
+            if entered == passphrase:
+                st.session_state.chat_unlocked = True
+                st.rerun()
+            else:
+                st.error("Wrong passphrase.")
+        return
+
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if len(st.session_state.chat_messages) >= CHAT_MAX_MESSAGES:
+        st.info("This chat session has reached its message limit. Reload the page to start a new one.")
+        return
+
+    prompt = st.chat_input("Ask about livestock futures pricing or dashboard data…")
+    if prompt:
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        api_history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_messages]
+        with st.chat_message("assistant"):
+            with st.spinner("Looking that up…"):
+                try:
+                    reply = run_chat_turn(anthropic_key, massive_key, as_of, api_history)
+                except requests.RequestException as e:
+                    reply = f"Sorry, the chat request failed: {e}"
+            st.markdown(reply)
+        st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+
+
 def render_commodity(commodity: dict, api_key: str, as_of: date):
     tab_futures, tab_spread, tab_matrix, tab_continuous = st.tabs(
         ["Seasonal futures", "Seasonal spread", "Spread matrix", "Continuous chart"]
@@ -1135,7 +1530,7 @@ def main():
 
     as_of = date.today()
 
-    labels = [c["label"] for c in COMMODITIES] + ["Spread Builder"]
+    labels = [c["label"] for c in COMMODITIES] + ["Spread Builder", "Chat"]
     tabs = st.tabs(labels)
     for tab, commodity in zip(tabs, COMMODITIES):
         with tab:
@@ -1143,8 +1538,10 @@ def main():
             if commodity["product_code"] == "LE":
                 st.caption(FND_NOTE)
             render_commodity(commodity, api_key, as_of)
-    with tabs[-1]:
+    with tabs[-2]:
         render_spread_builder(api_key, as_of)
+    with tabs[-1]:
+        render_chat(api_key, as_of)
 
 
 if __name__ == "__main__":
