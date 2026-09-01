@@ -92,7 +92,15 @@ def shift_ticker_year(ticker: str, product_code: str, delta: int) -> str | None:
 
 @st.cache_data(ttl="5m", show_spinner=False)
 def load_curve(product_code: str, api_key: str, as_of: str, n_contracts: int) -> pd.DataFrame:
-    return get_futures_curve(product_code, api_key, date.fromisoformat(as_of), n_contracts=n_contracts)
+    """Massive's contract list can lag a day right at midnight UTC rollover — the
+    server's local date ticks over before the feed has published that date's active
+    set, and /contracts comes back empty. Retry against yesterday rather than show
+    a false "no live contracts" warning for what is really just feed lag."""
+    d = date.fromisoformat(as_of)
+    curve = get_futures_curve(product_code, api_key, d, n_contracts=n_contracts)
+    if curve.empty:
+        curve = get_futures_curve(product_code, api_key, d - timedelta(days=1), n_contracts=n_contracts)
+    return curve
 
 
 @st.cache_data(ttl="6h", show_spinner="Loading settlement history…")
