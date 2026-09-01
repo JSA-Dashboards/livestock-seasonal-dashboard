@@ -46,6 +46,7 @@ COMMODITIES = [
     {"key": "feeder_cattle", "label": "Feeder Cattle", "sublabel": "CME · GF", "product_code": "GF", "unit": "¢/lb"},
     {"key": "lean_hogs", "label": "Lean Hogs", "sublabel": "CME · HE", "product_code": "HE", "unit": "¢/lb"},
 ]
+COMMODITY_BY_CODE = {c["product_code"]: c for c in COMMODITIES}
 
 MONTH_LETTERS = {
     "F": "Jan", "G": "Feb", "H": "Mar", "J": "Apr", "K": "May", "M": "Jun",
@@ -861,6 +862,242 @@ def render_continuous_chart(commodity: dict, api_key: str, as_of: date):
         export_row(calendar, f"{key}_report_calendar", key=f"rptcal_{key}")
 
 
+def _init_builder_legs():
+    if "sb_leg_count" not in st.session_state:
+        st.session_state.sb_leg_count = 2
+
+
+def render_spread_builder(api_key: str, as_of: date):
+    st.caption(
+        "Build a spread across 2 or more legs, any of them any commodity or contract month — "
+        "a same-commodity calendar spread, a cross-commodity spread (e.g. Live Cattle vs. Feeder "
+        "Cattle), or a weighted combination like a butterfly (+1 / −2 / +1)."
+    )
+    _init_builder_legs()
+    codes = [c["product_code"] for c in COMMODITIES]
+
+    # Default every leg to the same commodity (an ordinary calendar spread) —
+    # cross-commodity is something the user opts into via the dropdown, not
+    # something a fresh spread should start as.
+    for i in range(st.session_state.sb_leg_count):
+        st.session_state.setdefault(f"sb_code_{i}", codes[0])
+
+    curves: dict[str, pd.DataFrame] = {}
+
+    def get_curve(code: str) -> pd.DataFrame | None:
+        if code not in curves:
+            try:
+                curves[code] = load_curve(code, api_key, as_of.isoformat(), 10)
+            except MassiveApiError as e:
+                st.error(f"Couldn't load {COMMODITY_BY_CODE[code]['label']} quotes: {e}")
+                return None
+            if curves[code].empty:
+                st.warning(f"{COMMODITY_BY_CODE[code]['label']}: no live contracts.")
+                return None
+        return curves[code]
+
+    legs = []
+    for i in range(st.session_state.sb_leg_count):
+        row = st.container(horizontal=True, vertical_alignment="bottom")
+        with row:
+            code = st.selectbox(
+                "Commodity", codes, key=f"sb_code_{i}",
+                format_func=lambda p: COMMODITY_BY_CODE[p]["label"], width=140,
+            )
+            curve = get_curve(code)
+            if curve is None:
+                return
+            tickers = list(curve["ticker"])
+            # Key includes `code` — a leg's contract options depend on its own
+            # commodity choice, so switching commodity must be a fresh widget,
+            # not the same key reinterpreting a stale ticker against new options.
+            # index only seeds the value the first time this exact key exists,
+            # so it's a harmless no-op once the user has picked their own contract;
+            # it just makes a fresh leg default to the next month out, not the
+            # same front month as every other leg.
+            ticker = st.selectbox(
+                "Contract", tickers, index=min(i, len(tickers) - 1),
+                key=f"sb_ticker_{i}_{code}", width=130,
+                format_func=lambda t, c=code: friendly_contract(t, c),
+            )
+            st.session_state.setdefault(f"sb_weight_{i}", 1 if i % 2 == 0 else -1)
+            weight = st.number_input("Weight", min_value=-5, max_value=5, step=1,
+                                     key=f"sb_weight_{i}", width=90)
+            if st.session_state.sb_leg_count > 2:
+                if st.button(":material/close:", key=f"sb_remove_{i}", help="Remove this leg"):
+                    st.session_state.sb_leg_count -= 1
+                    st.rerun()
+        legs.append({"code": code, "ticker": ticker, "weight": weight,
+                     "expiry": dict(zip(curve["ticker"], curve["expiration"]))[ticker]})
+
+    if st.button(":material/add: Add leg", key="sb_add_leg"):
+        st.session_state.sb_leg_count += 1
+        st.rerun()
+
+    codes_used = {leg["code"] for leg in legs}
+    all_expiries: dict[str, date] = {}
+    for code in codes_used:
+        curve = curves.get(code)
+        if curve is not None:
+            all_expiries.update(dict(zip(curve["ticker"], curve["expiration"])))
+
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
+        years_back = st.slider("Prior years", 1, MAX_YEARS_BACK, 4, key="sb_years", width=170)
+        show_avg = st.toggle("Average", value=True, key="sb_avg")
+        window_label = st.segmented_control("Window", list(WINDOW_CHOICES), default="1Y", key="sb_win")
+        show_reports = st.toggle("Report dates", value=True, key="sb_rpt",
+                                 help="USDA report release dates relevant to the commodities in this spread.")
+
+    window_days = WINDOW_CHOICES.get(window_label or "1Y", 365)
+    anchor = legs[0]
+    anchor_expiry = anchor["expiry"]
+    label = " / ".join(f"{friendly_contract(leg['ticker'], leg['code'])} ({leg['weight']:+d})" for leg in legs)
+    units = {COMMODITY_BY_CODE[leg["code"]]["unit"] for leg in legs}
+    y_title = f"Spread ({next(iter(units))})" if len(units) == 1 else "Spread (mixed units)"
+
+    report_dates = {}
+    if show_reports:
+        for code in codes_used:
+            for r in REPORT_RELEVANCE.get(code, []):
+                report_dates.setdefault(r, [])
+        report_dates = {r: fetch_report_dates(r, (as_of - timedelta(days=730)).isoformat()) for r in report_dates}
+
+    all_tickers = set()
+    shifted_legs_by_year = []
+    for back in range(years_back + 1):
+        shifted = []
+        ok = True
+        for leg in legs:
+            t = shift_ticker_year(leg["ticker"], leg["code"], -back)
+            if not t:
+                ok = False
+                break
+            shifted.append({**leg, "ticker": t})
+            all_tickers.add(t)
+        shifted_legs_by_year.append(shifted if ok else None)
+
+    hist = load_histories(tuple(sorted(all_tickers)), api_key)
+
+    def combined_series(shifted_legs):
+        series_list = []
+        for leg in shifted_legs:
+            s = hist.get(leg["ticker"])
+            if s is None or not len(s):
+                return None
+            series_list.append(s * leg["weight"])
+        combo = series_list[0]
+        for s in series_list[1:]:
+            combo = combo.add(s, fill_value=None)
+        return combo.dropna()
+
+    st.caption(f"**{label}** — recent history")
+    current = combined_series(shifted_legs_by_year[0]) if shifted_legs_by_year[0] else None
+    if current is None or not len(current):
+        st.info("No overlapping settlement history for this combination of legs.")
+    else:
+        cutoff = as_of - timedelta(days=window_days)
+        shown = current[current.index >= cutoff]
+        if not len(shown):
+            st.info(f"No sessions inside the {window_label} window.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(shown.index), y=list(shown.values), mode="lines", name=label,
+                line=dict(color=YEAR_COLORS[0], width=2),
+                hovertemplate="%{x|%b %d, %Y}<br>%{y:+.3f}<extra></extra>",
+            ))
+            if as_of <= anchor_expiry:
+                _add_vline(fig, anchor_expiry, "leg 1 expiration", EXP_COLOR)
+                if anchor["code"] == "LE":
+                    _add_vline(fig, live_cattle_fnd(anchor_expiry), "leg 1 FND", FND_COLOR)
+            if report_dates:
+                add_report_vlines(fig, report_dates, shown.index.min(), shown.index.max())
+            _style_axes(fig, y_title, None)
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, width="stretch", key="sb_hist",
+                            config=plotly_config("spread_builder_history"))
+            export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
+                       "spread_builder_history", key="sb_hist_exp")
+            if report_dates:
+                st.caption("Dotted vertical lines mark USDA report release dates for the commodities "
+                          "in this spread: " + ", ".join(
+                              f"{r} ({REPORT_COLOR_NAMES[r]})" for r in report_dates) + ".")
+
+    st.caption(f"**{label}** — seasonal, aligned on leg 1's expiration")
+    fig = go.Figure()
+    by_dte: dict[str, pd.Series] = {}
+    skipped: list[str] = []
+    current_year_range = None
+
+    for back in range(years_back + 1):
+        shifted = shifted_legs_by_year[back]
+        combo_label = " / ".join(leg["ticker"] for leg in shifted) if shifted else f"back-{back}"
+        if not shifted:
+            skipped.append(combo_label)
+            continue
+        combo = combined_series(shifted)
+        if combo is None or not len(combo):
+            skipped.append(combo_label)
+            continue
+        leg1_ticker = shifted[0]["ticker"]
+        leg1_series = hist.get(leg1_ticker)
+        year_expiry = all_expiries.get(leg1_ticker, leg1_series.index.max() if leg1_series is not None and len(leg1_series) else None)
+        if year_expiry is None:
+            skipped.append(combo_label)
+            continue
+        dte = [-(year_expiry - d).days for d in combo.index]
+        keep = [i for i, d in enumerate(dte) if d >= -window_days]
+        if not keep:
+            skipped.append(combo_label)
+            continue
+
+        xs_dte = [dte[i] for i in keep]
+        xs = [anchor_expiry + timedelta(days=d) for d in xs_dte]
+        if back == 0:
+            current_year_range = (min(xs), max(xs))
+        ys = [combo.values[i] for i in keep]
+        name = combo_label + (" (current)" if back == 0 else "")
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=name,
+            line=dict(color=YEAR_COLORS[back % len(YEAR_COLORS)], width=3 if back == 0 else 1.5),
+            opacity=1.0 if back == 0 else 0.75,
+            hovertemplate=f"{name}<br>%{{y:+.3f}}<extra></extra>",
+        ))
+        by_dte[combo_label] = pd.Series(ys, index=pd.Index(xs_dte, name="dte"))
+
+    if not by_dte:
+        st.info("No overlapping settlement history for this combination's prior-year analogs.")
+    else:
+        if show_avg and len(by_dte) > 1:
+            avg = _year_grid_average(by_dte, window_days)
+            if len(avg):
+                fig.add_trace(go.Scatter(
+                    x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
+                    y=list(avg.values), mode="lines", name=f"Avg ({len(by_dte)}yr)",
+                    line=dict(color=AVG_COLOR, width=2.2, dash="dot"),
+                    hovertemplate="Avg<br>%{y:+.3f}<extra></extra>",
+                ))
+        if as_of <= anchor_expiry:
+            _add_vline(fig, anchor_expiry, "leg 1 expiration", EXP_COLOR)
+            if anchor["code"] == "LE":
+                _add_vline(fig, live_cattle_fnd(anchor_expiry), "leg 1 FND", FND_COLOR)
+        if report_dates and current_year_range:
+            add_report_vlines(fig, report_dates, *current_year_range)
+        _style_axes(fig, y_title, None)
+        st.plotly_chart(fig, width="stretch", key="sb_seas",
+                        config=plotly_config("spread_builder_seasonal"))
+        export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
+                   "spread_builder_seasonal", key="sb_seas_exp")
+        note = (
+            f"{len(by_dte)} year{'s' if len(by_dte) != 1 else ''} overlaid · x = 0 is "
+            f"leg 1's expiration, so every year lines up at the same point in its life."
+        )
+        if skipped:
+            note += f" No usable history for {', '.join(skipped)}."
+        st.caption(note)
+
+
 def render_commodity(commodity: dict, api_key: str, as_of: date):
     tab_futures, tab_spread, tab_matrix, tab_continuous = st.tabs(
         ["Seasonal futures", "Seasonal spread", "Spread matrix", "Continuous chart"]
@@ -898,13 +1135,16 @@ def main():
 
     as_of = date.today()
 
-    tabs = st.tabs([c["label"] for c in COMMODITIES])
+    labels = [c["label"] for c in COMMODITIES] + ["Spread Builder"]
+    tabs = st.tabs(labels)
     for tab, commodity in zip(tabs, COMMODITIES):
         with tab:
             st.caption(commodity["sublabel"])
             if commodity["product_code"] == "LE":
                 st.caption(FND_NOTE)
             render_commodity(commodity, api_key, as_of)
+    with tabs[-1]:
+        render_spread_builder(api_key, as_of)
 
 
 if __name__ == "__main__":
