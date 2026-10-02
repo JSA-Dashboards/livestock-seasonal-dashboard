@@ -42,6 +42,12 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown("""<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+</style>""", unsafe_allow_html=True)
+
 # Hide the Streamlit Community Cloud viewer badge (the profile avatar that links
 # to the creator's other apps) for a clean, client-facing footer.
 # The Streamlit Cloud badge (creator avatar + logo) is drawn by Cloud's outer page,
